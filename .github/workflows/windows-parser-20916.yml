@@ -1,0 +1,81 @@
+name: Windows parser tests for #20916
+
+on:
+  push:
+    branches:
+      - ci/windows-parser-20916
+    paths:
+      - .github/workflows/windows-parser-20916.yml
+
+permissions:
+  contents: read
+
+jobs:
+  parser:
+    name: Native x64 parser tests
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 45
+    steps:
+      - name: Check out the tested fix
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: '97464d7ed3d8888bb147b18d3c157f7ea6490ea2'
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Build and test the patched and original parser
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $root = $env:GITHUB_WORKSPACE
+          $source = 'src/terminal/parser/stateMachine.cpp'
+          $project = Join-Path $root 'src\terminal\parser\ut_parser\Parser.UnitTests.vcxproj'
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -version '[18.6,19.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $vs) {
+              throw 'Visual Studio 2026 18.6+ with the x64 C++ toolchain was not found.'
+          }
+          $msbuild = Join-Path $vs 'MSBuild\Current\Bin\amd64\MSBuild.exe'
+          & $msbuild -version
+          if ($LASTEXITCODE -ne 0) { throw 'MSBuild failed to start.' }
+
+          $nuget = Join-Path $root 'dep\nuget\nuget.exe'
+          & $nuget restore (Join-Path $root 'dep\nuget\packages.config') -PackagesDirectory (Join-Path $root 'packages') -ConfigFile (Join-Path $root 'NuGet.Config') -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw 'Terminal dependency restore failed.' }
+
+          $taef = Join-Path $root 'packages\Microsoft.Taef.10.100.251104001\build\Binaries\x64\te.exe'
+          $assembly = Join-Path $root 'bin\x64\Release\ConParser.Unit.Tests.dll'
+          $regression = 'DcsParamIgnoresControlCharacters'
+
+          function Build-ParserTests {
+              & $msbuild $project /m:2 /nologo /v:minimal /p:Configuration=Release /p:Platform=x64 "/p:SolutionDir=$root\"
+              if ($LASTEXITCODE -ne 0) { throw 'Building ConParser.Unit.Tests.dll failed.' }
+          }
+
+          function Run-ParserTests([string[]] $Options) {
+              $output = & $taef $assembly @Options 2>&1
+              $code = $LASTEXITCODE
+              $output | ForEach-Object { Write-Host $_ }
+              return @{ ExitCode = $code; Log = $output -join "`n" }
+          }
+
+          Write-Host 'Building the patched parser and running the complete parser test DLL.'
+          Build-ParserTests
+          $patched = Run-ParserTests -Options @()
+          if ($patched.ExitCode -ne 0 -or $patched.Log -notmatch '\bPassed\s*=\s*[1-9]\d*' -or $patched.Log -notmatch '\bFailed\s*=\s*0\b' -or $patched.Log -notmatch $regression) {
+              throw 'The patched parser suite did not report passing results including the new regression test.'
+          }
+
+          Write-Host 'Rebuilding with the original parser and running the same regression test.'
+          git restore '--source=HEAD^' -- $source
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to restore the original parser source.' }
+          Build-ParserTests
+          $before = Run-ParserTests -Options @("/name:*$regression")
+          if ($before.ExitCode -eq 0 -or $before.Log -notmatch '\bTotal\s*=\s*1\b' -or $before.Log -notmatch '\bFailed\s*=\s*1\b' -or $before.Log -notmatch $regression -or $before.Log -notmatch 'engine\.dcsId') {
+              throw 'The original parser did not reproduce the expected DCS identifier assertion failure.'
+          }
+
+          Write-Host 'The native regression failed on the original parser and passed with the fix.'
+          exit 0
